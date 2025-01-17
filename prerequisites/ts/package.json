@@ -1,0 +1,26 @@
+{
+  "name": "airdrop",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "MIT",
+  "scripts": {
+    "keygen": "ts-node ./src/keygen.ts",
+    "airdrop": "ts-node ./src/airdrop.ts",
+    "transferAll": "ts-node ./src/transferAll.ts",
+    "transferSmall": "ts-node ./src/transferSmall.ts",
+    "enroll": "ts-node ./src/enroll.ts",
+    "convert": "ts-node ./src/wallet-converter.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.30.1",
+    "@solana/web3.js": "^1.98.0",
+    "@types/node": "^22.10.5",
+    "bs58": "^6.0.0",
+    "prompt-sync": "^4.2.0",
+    "typescript": "^5.7.2"
+  },
+  "devDependencies": {
+    "@types/prompt-sync": "^4.2.3",
+    "ts-node": "^10.9.2"
+  }
+}
