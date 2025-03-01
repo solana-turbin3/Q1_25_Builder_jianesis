@@ -1,0 +1,1057 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+================================================================
+File Summary
+================================================================
+
+Purpose:
+--------
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+
+File Format:
+------------
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Multiple file entries, each consisting of:
+  a. A separator line (================)
+  b. The file path (File: path/to/file)
+  c. Another separator line
+  d. The full contents of the file
+  e. A blank line
+
+Usage Guidelines:
+-----------------
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+
+Notes:
+------
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+
+Additional Info:
+----------------
+
+================================================================
+Directory Structure
+================================================================
+programs/
+  freelunch/
+    src/
+      instruction/
+        claim.rs
+        fulfill_payment.rs
+        init.rs
+        merchant.rs
+        mod.rs
+        purchase.rs
+        stake.rs
+        unstake.rs
+      state/
+        buyer.rs
+        merchant.rs
+        mod.rs
+        payment.rs
+        vault.rs
+      error.rs
+      lib.rs
+    Cargo.toml
+    Xargo.toml
+.repomixignore
+Anchor.toml
+Cargo.toml
+repomix.config.json
+
+================================================================
+Files
+================================================================
+
+================
+File: programs/freelunch/src/instruction/claim.rs
+================
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Token, TokenAccount, Transfer, transfer};
+use crate::state::*;
+use crate::error::ErrorCode;
+
+#[derive(Accounts)]
+pub struct MerchantClaim<'info> {
+    /// The merchant claiming their funds.
+    #[account(mut)]
+    pub merchant: Signer<'info>,
+
+    /// The PoF must belong to this merchant.
+    #[account(
+        mut,
+        constraint = proof_of_payment.merchant == merchant.key() @ ErrorCode::Unauthorized,
+    )]
+    pub proof_of_payment: Account<'info, ProofOfFuturePayment>,
+
+    /// The buyer account associated with this PoF, so we can unlock collateral if fully paid.
+    #[account(mut)]
+    pub buyer_account: Account<'info, BuyerAccount>,
+
+    /// Protocol’s token account (holding USDC). We’ll transfer from here to the merchant.
+    #[account(mut)]
+    pub protocol_usdc_account: Account<'info, TokenAccount>,
+
+    /// The merchant’s USDC token account (where funds go).
+    #[account(mut)]
+    pub merchant_usdc_account: Account<'info, TokenAccount>,
+
+    /// The protocol vault, in case we need to check or sign with a PDA. Omitted if you have no constraints.
+    #[account(mut)]
+    pub protocol_vault: Account<'info, ProtocolVault>,
+
+    /// Standard programs.
+    pub token_program: Program<'info, Token>,
+}
+
+
+impl<'info> MerchantClaim<'info> {
+    /// The merchant can claim up to `amount_to_claim` from the PoF.
+    /// If the PoF can be partially paid, they get partial. If it covers the entire remainder, the PoF is closed.
+    pub fn merchant_claim(&mut self, amount_to_claim: u64) -> Result<()> {
+        let proof = &mut self.proof_of_payment;
+        let buyer_account = &mut self.buyer_account;
+
+        // 1. Check if already completed
+        require!(proof.completed == 0, ErrorCode::PaymentAlreadyCompleted);
+
+        // 2. Figure out how much remains
+        let remaining_due = proof.payment_amount
+            .checked_sub(proof.amount_fulfilled)
+            .ok_or(ErrorCode::Unauthorized)?; // shouldn't happen if completed=0
+        let claim_now = std::cmp::min(amount_to_claim, remaining_due);
+
+        // 3. Transfer from the protocol’s USDC account to the merchant’s USDC account
+        let cpi_ctx = CpiContext::new(
+            self.token_program.to_account_info(),
+            Transfer {
+                from: self.protocol_usdc_account.to_account_info(),
+                to: self.merchant_usdc_account.to_account_info(),
+                authority: self.merchant.to_account_info(), 
+                // If your protocol uses a PDA authority, replace 
+                // 'ctx.accounts.merchant.to_account_info()' with that
+                // and require a CPI signature or another approach.
+            },
+        );
+        transfer(cpi_ctx, claim_now)?;
+
+        // 4. Update PoF fields
+        proof.amount_fulfilled = proof.amount_fulfilled
+            .checked_add(claim_now)
+            .ok_or(ErrorCode::Unauthorized)?;
+
+        // 5. If fully paid, mark completed and unlock the collateral for the buyer
+        if proof.amount_fulfilled >= proof.payment_amount {
+            proof.completed = 1;
+            buyer_account.locked_amount = buyer_account.locked_amount
+                .checked_sub(proof.locked_collateral)
+                .ok_or(ErrorCode::Unauthorized)?;
+            buyer_account.unlockable_amount = buyer_account.unlockable_amount
+                .checked_add(proof.locked_collateral)
+                .ok_or(ErrorCode::Unauthorized)?;
+        }
+
+        Ok(())
+    }
+}
+
+================
+File: programs/freelunch/src/instruction/fulfill_payment.rs
+================
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Token, TokenAccount, Transfer, transfer};
+use crate::state::*;
+use crate::error::ErrorCode;
+
+// We'll assume the protocol or an admin calls this on a schedule (like daily or weekly).
+#[derive(Accounts)]
+pub struct FulfillProofOfPayment<'info> {
+    // Some authority who can fulfill payments—could be a PDA or an admin
+    // that orchestrates these partial payments
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    // The protocol's token account that holds USDC (harvested from Solend).
+    // We'll transfer from here to the merchant.
+    #[account(mut)]
+    pub protocol_usdc_account: Account<'info, TokenAccount>,
+
+    // The merchant's USDC token account (the final destination of the funds).
+    #[account(mut)]
+    pub merchant_usdc_account: Account<'info, TokenAccount>,
+
+    // The ProofOfFuturePayment record to fulfill
+    #[account(mut)]
+    pub proof_of_payment: Account<'info, ProofOfFuturePayment>,
+
+    // The buyer's account, so we can unlock collateral if we fully pay the PoF
+    #[account(mut)]
+    pub buyer_account: Account<'info, BuyerAccount>,
+
+    // The protocol vault might be needed if we have constraints on who can sign for the transfer
+    // or if the vault is a PDA that must sign. For simplicity, we skip that here.
+    #[account(mut)]
+    pub protocol_vault: Account<'info, ProtocolVault>,
+
+    // If you want to harvest from Solend just before paying, you'd add
+    // the solend accounts here. (Reserve, cUSDC account, etc.)
+    // Then you'd do a CPI to claim the rewards into `protocol_usdc_account`.
+
+    // Standard programs
+    pub token_program: Program<'info, Token>,
+}
+
+impl<'info> FulfillProofOfPayment<'info> {
+    pub fn complete_payment(
+        &mut self,
+        amount_to_pay_now: u64
+    ) -> Result<()> {
+        let proof = &mut self.proof_of_payment;
+        let buyer_account = &mut self.buyer_account;
+        
+        // 1. Check if PoF is already completed
+        require!(proof.completed == 0, ErrorCode::PaymentAlreadyCompleted);
+
+        // 2. Bound `amount_to_pay_now` by what remains
+        let remaining_due = proof.payment_amount
+            .checked_sub(proof.amount_fulfilled)
+            .ok_or(ErrorCode::Unauthorized)?; // shouldn't happen if completed=0
+        let pay_now = std::cmp::min(amount_to_pay_now, remaining_due);
+
+        // 3. Transfer from protocol_usdc_account to merchant_usdc_account
+        let cpi_ctx = CpiContext::new(
+            self.token_program.to_account_info(),
+            Transfer {
+                from: self.protocol_usdc_account.to_account_info(),
+                to: self.merchant_usdc_account.to_account_info(),
+                authority: self.payer.to_account_info(),
+            },
+        );
+        transfer(cpi_ctx, pay_now)?;
+
+        // 4. Update PoF fields
+        proof.amount_fulfilled = proof.amount_fulfilled
+            .checked_add(pay_now)
+            .ok_or(ErrorCode::Unauthorized)?;
+
+        // 5. If fully paid, mark completed & unlock collateral
+        if proof.amount_fulfilled >= proof.payment_amount {
+            proof.completed = 1;
+
+            // Buyer can now unlock that portion of collateral
+            // Subtract locked_collateral from buyer's locked_amount
+            // Add it back to buyer's unlockable_amount
+            // Because the PoF is satisfied, the collateral can be freed
+
+            buyer_account.locked_amount = buyer_account.locked_amount
+                .checked_sub(proof.locked_collateral)
+                .ok_or(ErrorCode::Unauthorized)?;
+            buyer_account.unlockable_amount = buyer_account.unlockable_amount
+                .checked_add(proof.locked_collateral)
+                .ok_or(ErrorCode::Unauthorized)?;
+        }
+
+        Ok(())
+    }
+}
+
+================
+File: programs/freelunch/src/instruction/init.rs
+================
+use anchor_lang::prelude::*;
+use crate::state::*;
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(
+        init,
+        payer = admin,
+        space = ProtocolVault::INIT_SPACE + 8,
+        seeds = [b"protocol_vault"],
+        bump
+    )]
+    pub protocol_vault: Account<'info, ProtocolVault>,
+
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+impl<'info> Initialize<'info> {
+    pub fn init(&mut self) -> Result<()> {
+        self.protocol_vault.set_inner(
+            ProtocolVault {
+                admin: *self.admin.key,
+                total_staked: 0,
+                total_rewards: 0,
+                pending_payments: 0,
+                last_payment_number: 0,
+            }
+        );
+        Ok(())
+    }
+}
+
+================
+File: programs/freelunch/src/instruction/merchant.rs
+================
+use anchor_lang::prelude::*;
+use crate::state::*;
+
+#[derive(Accounts)]
+pub struct MerchantInit<'info> {
+    #[account(mut)]
+    pub merchant: Signer<'info>,
+
+    #[account(
+        init,
+        payer = merchant,
+        space = MerchantAccount::INIT_SPACE + 8,
+        seeds = [b"merchant", merchant.key().as_ref()],
+        bump
+    )]
+    pub merchant_account: Account<'info, MerchantAccount>,
+
+    pub system_program: Program<'info, System>,
+}
+
+impl<'info> MerchantInit<'info> {
+    pub fn merchant_init(&mut self) -> Result<()> {
+      self.merchant_account.set_inner(
+        MerchantAccount {
+            merchant: *self.merchant.key,
+            status: 1,
+            payment_number: 0,
+            amount_transacted: 0,
+        }
+      );
+      
+      Ok(())
+    }
+}
+
+================
+File: programs/freelunch/src/instruction/mod.rs
+================
+pub mod init;
+pub mod stake;
+pub mod unstake;
+pub mod merchant;
+pub mod purchase;
+pub mod fulfill_payment;
+pub mod claim;
+
+pub use init::*;
+pub use stake::*;
+pub use unstake::*;
+pub use merchant::*;
+pub use purchase::*;
+pub use fulfill_payment::*;
+pub use claim::*;
+
+================
+File: programs/freelunch/src/instruction/purchase.rs
+================
+use anchor_lang::prelude::*;
+use solend_sdk::math::{Decimal, TryAdd, TryDiv, TryMul, TrySub, WAD};
+use solend_sdk::solana_program::program_pack::Pack;
+use solend_sdk::state::Reserve;
+use crate::state::*;
+use crate::error::ErrorCode;
+
+#[derive(Accounts)]
+pub struct CreateProofOfPayment<'info> {
+    // The admin verifies the purchase off-chain and signs to create PoF
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    // The buyer's staking account
+    #[account(
+        mut,
+        constraint = buyer_account.staked_amount > 0 @ ErrorCode::InsufficientStake
+    )]
+    pub buyer_account: Account<'info, BuyerAccount>,
+
+    // unique seed (buyer + merchant + merchant.payment_number)
+    #[account(
+        init,
+        payer = admin,
+        space = ProofOfFuturePayment::INIT_SPACE + 8,
+        seeds = [b"proof_of_payment", buyer_account.buyer.key().as_ref(), merchant_account.merchant.key().as_ref(), merchant_account.payment_number.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub proof_of_payment: Account<'info, ProofOfFuturePayment>,
+
+    // Merchant account to track how many payments have been assigned
+    #[account(
+        mut,
+        seeds = [b"merchant", merchant_account.merchant.key().as_ref()],
+        bump
+    )]
+    pub merchant_account: Account<'info, MerchantAccount>,
+
+    // The merchant's account (just for verification)
+    #[account()]
+    pub merchant: SystemAccount<'info>,
+
+    /// The Solend reserve account holding interest rate data
+    #[account(mut)]
+    pub solend_reserve: AccountInfo<'info>,
+
+
+    pub system_program: Program<'info, System>,
+}
+
+impl<'info> CreateProofOfPayment<'info> {
+    // create proof of payment
+    pub fn purchase(
+        &mut self,
+        purchase_amount: u64,   // e.g. 5 USDC
+        annual_apy_bps: u64,   // e.g. 1000 for 10.00%
+        buffer_bps: u64         // e.g. 500 for an extra 5% buffer
+    ) -> Result<()> {
+        let solend_reserve_data = self.solend_reserve.data.borrow();
+        let reserve: Reserve = Reserve::unpack(&solend_reserve_data)
+            .map_err(|_| error!(ErrorCode::Unauthorized))?;
+
+        // Derive deposit APY from reserve fields
+        let deposit_apy_bps = Self::compute_deposit_apy_bps(&reserve)?;
+
+
+        let buyer_account = &mut self.buyer_account;
+        let merchant_account = &mut self.merchant_account;
+        let proof = &mut self.proof_of_payment;
+
+        // 1. Calculate base locked collateral based on APY
+        // locked_value = purchase_amount * 10000 / annual_apy_bps
+        require!(annual_apy_bps > 0, ErrorCode::Unauthorized);
+
+        let base_locked_value = purchase_amount
+            .checked_mul(10000)
+            .ok_or(ErrorCode::Unauthorized)?
+            .checked_div(deposit_apy_bps) // APY derived from reserve
+            .ok_or(ErrorCode::Unauthorized)?;
+
+        // 2. Add buffer
+        // locked_value = base_locked_value * (10000 + buffer_bps) / 10000
+        let locked_value_with_buffer = base_locked_value
+            .checked_mul(10000 + buffer_bps)
+            .ok_or(ErrorCode::Unauthorized)?
+            .checked_div(10000)
+            .ok_or(ErrorCode::Unauthorized)?;
+
+        // Ensure the buyer has enough unlockable funds
+        require!(buyer_account.unlockable_amount >= locked_value_with_buffer, ErrorCode::InsufficientFunds);
+
+        // 3. Lock that collateral
+        buyer_account.unlockable_amount = buyer_account.unlockable_amount
+            .checked_sub(locked_value_with_buffer)
+            .ok_or(ErrorCode::InsufficientFunds)?;
+        buyer_account.locked_amount = buyer_account.locked_amount
+            .checked_add(locked_value_with_buffer)
+            .ok_or(ErrorCode::Unauthorized)?;
+
+        // 4. Fill out the proof of payment
+        proof.payment_amount = purchase_amount; // e.g. 5 USDC
+        proof.locked_collateral = locked_value_with_buffer;  // e.g. 52 or 53 USDC w/ buffer
+        proof.admin = *self.admin.key;
+        proof.buyer = buyer_account.buyer;
+        proof.merchant = merchant_account.merchant;
+        proof.completed = 0; // 0 => not paid, 1 => completed
+        proof.payment_number = merchant_account.payment_number;
+        proof.amount_fulfilled = 0;
+
+        // 5. Increment the merchant's payment_number
+        merchant_account.payment_number += 1;
+        Ok(())
+    }
+
+    /// Use the fields from `reserve` to derive deposit APY. 
+    /// Often deposit_apy ~ utilization * borrow_rate * (1 - protocol_cut).
+    fn compute_deposit_apy_bps(reserve: &Reserve) -> Result<u64> {
+        // 1) Compute utilization = borrowed_amount / (borrowed_amount + available_amount)
+        // 2) Compute borrow_rate from config fields, e.g. `reserve.current_borrow_rate()`
+        // 3) deposit_apy = borrow_rate * utilization * (1 - protocol_take_rate)
+        // Convert to basis points.
+        
+        let total_supply = reserve.liquidity.borrowed_amount_wads // as Decimal
+            .try_add(Decimal::from(reserve.liquidity.available_amount))
+            .map_err(|_| ErrorCode::Unauthorized)?;
+
+        if total_supply == Decimal::zero() {
+            // no liquidity => APY is zero or negligible
+            return Ok(0);
+        }
+
+        let utilization = reserve.liquidity.borrowed_amount_wads
+            .try_div(total_supply)
+            .map_err(|_| ErrorCode::Unauthorized)?;
+
+        // This is simplified. The real logic is in `reserve.current_borrow_rate()`
+        // But let's pretend we do something like:
+        let borrow_rate_pct = reserve.config.optimal_borrow_rate; // e.g. 10 => 10%
+        let borrow_rate = Decimal::from(borrow_rate_pct as u64).try_div(Decimal::from(100u64))
+            .map_err(|_| ErrorCode::Unauthorized)?;
+        
+        let protocol_take_rate = Decimal::from(reserve.config.protocol_take_rate as u64)
+            .try_div(Decimal::from(100u64))
+            .map_err(|_| ErrorCode::Unauthorized)?;
+
+        // deposit_apy (decimal) = utilization * borrow_rate * (1 - protocol_take_rate)
+        let deposit_apy_decimal = utilization
+            .try_mul(borrow_rate)
+            .map_err(|_| ErrorCode::Unauthorized)?
+            .try_mul(Decimal::one().try_sub(protocol_take_rate)?)
+            .map_err(|_| ErrorCode::Unauthorized)?;
+
+        // Convert decimal to basis points (1.0 -> 10000 bps)
+        let deposit_apy_bps = deposit_apy_decimal
+            .to_scaled_val()
+            .map_err(|_| ErrorCode::Unauthorized)?
+            .checked_div((WAD / 10_000).into())
+            .ok_or(ErrorCode::Unauthorized)?;
+        
+        Ok(deposit_apy_bps.try_into().unwrap())
+    }
+}
+
+================
+File: programs/freelunch/src/instruction/stake.rs
+================
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Token, TokenAccount, Transfer, transfer};
+use solend_sdk::solana_program::program::invoke;
+use solend_sdk::{
+    self,
+    instruction::deposit_reserve_liquidity,  // The official CPI call
+    // state::Reserve as SolendReserveState,     // If you want to parse on-chain data
+};
+
+use crate::state::{BuyerAccount, ProtocolVault};
+
+use crate::error::ErrorCode; // If you want to handle custom errors
+
+#[derive(Accounts)]
+pub struct StakeAsset<'info> {
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+
+    // The user's USDC token account (holding actual USDC)
+    #[account(
+        mut,
+        constraint = buyer_usdc_account.mint == usdc_mint.key() @ ErrorCode::Unauthorized
+    )]
+    pub buyer_usdc_account: Account<'info, TokenAccount>,
+
+    // This is the USDC mint - might be verified in your context
+    pub usdc_mint: AccountInfo<'info>,
+
+    // BuyerAccount storing staked amounts, etc.
+    #[account(
+        init_if_needed,
+        payer = buyer,
+        space = BuyerAccount::INIT_SPACE + 8,
+        seeds = [b"buyer", buyer.key().as_ref()],
+        bump
+    )]
+    pub buyer_account: Account<'info, BuyerAccount>,
+
+    // ProtocolVault that tracks total staked
+    #[account(
+        mut,
+        seeds = [b"protocol_vault"],
+        bump
+    )]
+    pub protocol_vault: Account<'info, ProtocolVault>,
+
+    // The Solend Reserve for USDC. Typically you’d pass in more accounts:
+    // e.g. Reserve liquidity, lending market, lending market authority, etc.
+    #[account(mut)]
+    pub solend_reserve: AccountInfo<'info>,
+
+    // The collateral token mint or cUSDC mint Solend uses (if relevant).
+    // To receive cUSDC into a program-owned account, pass that here.
+    #[account(mut)]
+    pub solend_collateral_mint: AccountInfo<'info>,
+
+    // A token account (PDA) to hold the cUSDC on behalf of your program or user
+    // so that the user can't move it unilaterally
+    #[account(mut)]
+    pub protocol_collateral_account: Account<'info, TokenAccount>,
+
+    // The Solend program itself
+    pub solend_program: AccountInfo<'info>,
+
+    // Required for SPL token transfers
+    pub token_program: Program<'info, Token>,
+
+    // System program for creating new accounts if needed
+    pub system_program: Program<'info, System>,
+}
+
+impl<'info> StakeAsset<'info> {
+    pub fn stake1(&mut self, amount: u64) -> Result<()> {
+        // Access all the accounts more succinctly
+        let buyer = &self.buyer;
+        let buyer_account = &mut self.buyer_account;
+        let protocol_vault = &mut self.protocol_vault;
+        let user_usdc_account = &self.buyer_usdc_account;
+        let protocol_collateral_account = &self.protocol_collateral_account;
+        let token_program = &self.token_program;
+
+        // 1. Transfer USDC from user to Solend Reserve (via CPI).
+        //    In practice, Solend has a specialized deposit instruction. 
+        //    This is a simplified approach showing a direct SPL transfer
+        //    but you'll want to call Solend's depositReserveLiquidity instruction instead.
+
+        // Pseudocode: build & invoke deposit instruction to solend:
+        // let deposit_ix = solend_instruction::deposit_reserve_liquidity(...);
+        // let accounts = [...];
+        // invoke(&deposit_ix, &accounts)?;
+
+        // For demonstration, just do an SPL token transfer from user to your program,
+        // representing that the tokens end up under your program's control.
+        let cpi_ctx = CpiContext::new(
+            token_program.to_account_info(),
+            Transfer {
+                from: user_usdc_account.to_account_info(),
+                to: protocol_collateral_account.to_account_info(),
+                authority: buyer.to_account_info(),
+            },
+        );
+        transfer(cpi_ctx, amount)?;
+
+        // 2. Update your program's internal state
+        buyer_account.buyer = *buyer.key;
+        buyer_account.staked_amount += amount;
+        buyer_account.unlockable_amount += amount;
+        protocol_vault.total_staked += amount;
+
+        Ok(())
+    }
+
+    pub fn stake(&mut self, amount: u64) -> Result<()> {
+        let buyer = &self.buyer;
+        let buyer_account = &mut self.buyer_account;
+        let protocol_vault = &mut self.protocol_vault;
+    
+        // 1) Build Solend’s deposit_reserve_liquidity instruction
+        // Make sure you pass in exactly the accounts Solend expects
+        // in the correct order. Check Solend docs for the latest param list.
+    
+        let deposit_ix = deposit_reserve_liquidity(
+            self.solend_program.key(),         // Solend program ID
+            amount,                            // How many tokens to deposit
+            self.buyer_usdc_account.key(),     // Source USDC token account
+            self.protocol_collateral_account.key(), // Where cUSDC/collateral will be minted to
+            self.solend_reserve.key(),         // The Solend reserve account
+            self.solend_reserve.key(),         // Reserve liquidity supply account
+            self.solend_collateral_mint.key(), // Reserve collateral mint
+            self.solend_reserve.key(),         // Lending market account
+            self.solend_reserve.key(),         // Lending market authority
+        );
+    
+        // 2) Gather the AccountInfos into a slice 
+        //    (all the accounts that deposit_reserve_liquidity expects)
+        let account_infos = &[
+            self.buyer.to_account_info(),
+            self.buyer_usdc_account.to_account_info(),
+            self.protocol_collateral_account.to_account_info(),
+            self.solend_reserve.to_account_info(),
+            // add the other PDAs for the Solend Reserve Liquidity supply, lending market, etc.
+            self.token_program.to_account_info(),
+            self.solend_program.to_account_info(),
+        ];
+    
+        // 3) If a PDA needs to sign, you’d do `invoke_signed`. If the user just signs, you do `invoke`.
+        //    If the buyer is the authority, you might do:
+        invoke(
+            &deposit_ix,
+            account_infos,
+        )?;
+    
+        // 4) Now that the deposit is successful, you can update your local state.
+        buyer_account.buyer = *buyer.key;
+        buyer_account.staked_amount += amount;
+        buyer_account.unlockable_amount += amount;
+    
+        protocol_vault.total_staked += amount;
+    
+        Ok(())
+    }
+}
+
+================
+File: programs/freelunch/src/instruction/unstake.rs
+================
+use anchor_lang::{prelude::*, system_program::{transfer, Transfer}};
+use anchor_spl::token::{Token, TokenAccount};
+use crate::state::*;
+
+use crate::error::ErrorCode;
+
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"buyer", buyer.key().as_ref()],
+        bump
+    )]
+    pub buyer_account: Account<'info, BuyerAccount>,
+
+    #[account(mut, seeds = [b"protocol_vault"], bump)]
+    pub protocol_vault: Account<'info, ProtocolVault>,
+
+    #[account(mut)]
+    pub buyer_usdc_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub protocol_usdc_account: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+
+    // pub system_program: Program<'info, System>,
+}
+
+impl<'info> Withdraw<'info> {
+    pub fn unstake(&mut self, amount: u64) -> Result<()> {
+        let buyer_account = &mut self.buyer_account;
+        let protocol_vault = &mut self.protocol_vault;
+        let buyer_usdc_account = &self.buyer_usdc_account;
+        let protocol_usdc_account = &self.protocol_usdc_account;
+        let token_program = &self.token_program;
+
+        require!(buyer_account.unlockable_amount >= amount, ErrorCode::InsufficientFunds);
+
+        // Transfer USDC back from protocol vault to buyer
+        let cpi_ctx = CpiContext::new(
+            token_program.to_account_info(),
+            Transfer {
+                from: protocol_usdc_account.to_account_info(),
+                to: buyer_usdc_account.to_account_info(),
+            },
+        );
+        transfer(cpi_ctx, amount)?;
+
+        // Update buyer and protocol states
+        buyer_account.staked_amount -= amount;
+        buyer_account.unlockable_amount -= amount;
+        protocol_vault.total_staked -= amount;
+
+        Ok(())
+    }
+}
+
+================
+File: programs/freelunch/src/state/buyer.rs
+================
+use anchor_lang::prelude::*;
+
+#[account]
+#[derive(InitSpace)]
+pub struct BuyerAccount {
+    pub buyer: Pubkey, // The buyer's public key
+    pub staked_amount: u64, // Total amount staked
+    pub unlockable_amount: u64, // Amount that can be withdrawn
+    pub locked_amount: u64, // Locked amount for pending payments
+    pub reward_amount: u64, // Rewards earned from staking
+}
+
+================
+File: programs/freelunch/src/state/merchant.rs
+================
+use anchor_lang::prelude::*;
+
+#[account]
+#[derive(InitSpace)]
+pub struct MerchantAccount {
+    pub merchant: Pubkey, // The merchant's public key
+    pub status: u8, // KYB verification status (0: Pending, 1: Approved)
+    pub payment_number: u64, // Number of payments received
+    pub amount_transacted: u64, // Total amount received from buyers
+}
+
+================
+File: programs/freelunch/src/state/mod.rs
+================
+pub mod buyer;
+pub mod merchant;
+pub mod payment;
+pub mod vault;
+
+pub use buyer::*;
+pub use merchant::*;
+pub use payment::*;
+pub use vault::*;
+
+================
+File: programs/freelunch/src/state/payment.rs
+================
+use anchor_lang::prelude::*;
+
+#[account]
+#[derive(InitSpace)]
+pub struct ProofOfFuturePayment {
+    pub payment_amount: u64, // Amount owed to merchant
+    pub locked_collateral: u64,   // How much is locked to generate yield for payment
+    pub admin: Pubkey, // Protocol admin managing payouts
+    pub buyer: Pubkey, // The buyer responsible for the payment
+    pub merchant: Pubkey, // The merchant receiving the payment
+    pub completed: u8, // Payment status (0: Pending, 1: Completed)
+    pub payment_number: u64, // Payment ID for tracking
+    pub amount_fulfilled: u64, // Amount already paid
+}
+
+================
+File: programs/freelunch/src/state/vault.rs
+================
+use anchor_lang::prelude::*;
+
+#[account]
+#[derive(InitSpace)]
+pub struct ProtocolVault {
+    pub admin: Pubkey, // Admin of the protocol
+    pub total_staked: u64, // Total USDC staked across all users
+    pub total_rewards: u64, // Total rewards generated from staking
+    pub pending_payments: u64, // Total outstanding Proof of Future Payments
+    pub last_payment_number: u64, // Tracking last processed payment
+}
+
+================
+File: programs/freelunch/src/error.rs
+================
+use anchor_lang::prelude::*;
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Insufficient unlockable funds.")]
+    InsufficientFunds,
+
+    #[msg("Invalid merchant account.")]
+    InvalidMerchant,
+
+    #[msg("Unauthorized operation.")]
+    Unauthorized,
+
+    #[msg("Insufficient staked amount.")]
+    InsufficientStake,
+
+    #[msg("Payment already completed.")]
+    PaymentAlreadyCompleted,
+
+    #[msg("Invalid proof of future payment.")]
+    InvalidProofOfPayment,
+}
+
+================
+File: programs/freelunch/src/lib.rs
+================
+pub mod instruction;
+pub mod state;
+pub mod error;
+
+
+use anchor_lang::prelude::*;
+
+pub use instruction::*;
+
+
+declare_id!("AXnYea6Je9Ui31N6cY8y2oPfppETrh5sr6U31B5A77VQ");
+
+// #[program]
+pub mod freelunch {
+    use super::*;
+
+     /// 1) Initialize the protocol vault
+     pub fn init(ctx: Context<Initialize>) -> Result<()> {
+        ctx.accounts.init()
+    }
+
+    /// 2) Stake into protocol
+    pub fn stake(ctx: Context<StakeAsset>, amount: u64) -> Result<()> {
+        ctx.accounts.stake(amount)
+    }
+
+    /// 3) Unstake from protocol
+    pub fn unstake(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+        ctx.accounts.unstake(amount)
+    }
+
+    /// 4) Merchant Initialize
+    pub fn merchant_init(ctx: Context<MerchantInit>) -> Result<()> {
+        ctx.accounts.merchant_init()
+    }
+
+    /// 5) Create a proof-of-payment (purchase)
+    pub fn create_proof_of_payment(
+        ctx: Context<CreateProofOfPayment>,
+        purchase_amount: u64,
+        annual_apy_bps: u64,
+        buffer_bps: u64
+    ) -> Result<()> {
+        ctx.accounts.purchase(purchase_amount, annual_apy_bps, buffer_bps)
+    }
+
+    /// 6) Fulfill an outstanding proof-of-payment with yield (admin or crank usage)
+    pub fn fulfill_proof_of_payment(
+        ctx: Context<FulfillProofOfPayment>,
+        amount_to_pay_now: u64
+    ) -> Result<()> {
+        ctx.accounts.complete_payment(amount_to_pay_now)
+    }
+
+    /// 7) Merchant claims partial or full payment
+    pub fn merchant_claim(
+        ctx: Context<MerchantClaim>,
+        amount_to_claim: u64
+    ) -> Result<()> {
+        ctx.accounts.merchant_claim(amount_to_claim)
+    }
+
+}
+
+================
+File: programs/freelunch/Cargo.toml
+================
+[package]
+name = "freelunch"
+version = "0.1.0"
+description = "Created with Anchor"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "freelunch"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+anchor-debug = []
+
+[dependencies]
+anchor-lang = { version = "0.30.1", features = ["init-if-needed"] }
+anchor-spl = { version = "0.30.1"}
+# solend-sdk = "0.1.0"
+solend-sdk = { git = "https://github.com/jianesis/solana-program-library.git", branch = "mainnet" }
+
+================
+File: programs/freelunch/Xargo.toml
+================
+[target.bpfel-unknown-unknown.dependencies.std]
+features = []
+
+================
+File: .repomixignore
+================
+# Add patterns to ignore here, one per line
+# Example:
+# *.log
+# tmp/
+node_modules
+migrations
+target
+tests
+.gitignore
+.prettierignore
+package.json
+yarn.lock
+tsconfig.json
+app
+
+================
+File: Anchor.toml
+================
+[toolchain]
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+freelunch = "AXnYea6Je9Ui31N6cY8y2oPfppETrh5sr6U31B5A77VQ"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "Localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+
+================
+File: Cargo.toml
+================
+[workspace]
+members = [
+    "programs/*"
+]
+resolver = "2"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+[profile.release.build-override]
+opt-level = 3
+incremental = false
+codegen-units = 1
+
+================
+File: repomix.config.json
+================
+{
+  "output": {
+    "filePath": "repomix-output.txt",
+    "style": "plain",
+    "parsableStyle": false,
+    "fileSummary": true,
+    "directoryStructure": true,
+    "removeComments": false,
+    "removeEmptyLines": false,
+    "compress": false,
+    "topFilesLength": 5,
+    "showLineNumbers": false,
+    "copyToClipboard": false
+  },
+  "include": [],
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": []
+  },
+  "security": {
+    "enableSecurityCheck": true
+  },
+  "tokenCount": {
+    "encoding": "o200k_base"
+  }
+}
+
+
+
+================================================================
+End of Codebase
+================================================================

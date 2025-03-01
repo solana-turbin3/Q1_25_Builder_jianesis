@@ -1,0 +1,14 @@
+# Add patterns to ignore here, one per line
+# Example:
+# *.log
+# tmp/
+node_modules
+migrations
+target
+tests
+.gitignore
+.prettierignore
+package.json
+yarn.lock
+tsconfig.json
+app
