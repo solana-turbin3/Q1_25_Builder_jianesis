@@ -8,13 +8,19 @@ use crate::error::ErrorCode;
 // We'll assume the protocol or an admin calls this on a schedule (like daily or weekly).
 #[derive(Accounts)]
 pub struct FulfillProofOfPayment<'info> {
-    // Some authority who can fulfill payments—could be a PDA or an admin
-    // that orchestrates these partial payments
-    #[account(mut)]
-    pub payer: Signer<'info>,
+    /// CHECK: This is the protocol's trusted signer; signature verified in instruction.
+    #[account(signer)]
+    pub protocol_signer: AccountInfo<'info>,
+
+    // The protocol vault (PDA)
+    #[account(
+        mut,
+        seeds = [b"protocol_vault"],
+        bump = protocol_vault.bump
+    )]
+    pub protocol_vault: Account<'info, ProtocolVault>,
 
     // The protocol's token account that holds USDC (harvested from Solend).
-    // We'll transfer from here to the merchant.
     #[account(mut)]
     pub protocol_usdc_account: Account<'info, TokenAccount>,
 
@@ -30,37 +36,31 @@ pub struct FulfillProofOfPayment<'info> {
     #[account(mut)]
     pub buyer_account: Account<'info, BuyerAccount>,
 
-    // The protocol vault might be needed if we have constraints on who can sign for the transfer
-    // or if the vault is a PDA that must sign. For simplicity, we skip that here.
-    #[account(
-        mut,
-        seeds = [b"protocol_vault"],
-        bump
-    )]
-    pub protocol_vault: Account<'info, ProtocolVault>,
-
-    // SolendAccount
-    pub solend_program: AccountInfo<'info>,
-    #[account(mut)]
-    pub protocol_collateral_account: Account<'info, TokenAccount>,
-
-    // Solends accounts
-    #[account(mut)]
-    pub solend_reserve: AccountInfo<'info>,
-    pub reserve_liquidity_supply: AccountInfo<'info>,
-    pub reserve_collateral_mint: AccountInfo<'info>,
-    pub lending_market: AccountInfo<'info>,
-    pub lending_market_authority: AccountInfo<'info>,
-
-    // Standard programs
-    pub token_program: Program<'info, Token>,
-
     #[account(
         mut,
         seeds = [b"merchant", proof_of_payment.merchant.key().as_ref()],
         bump
     )]
     pub merchant_account: Account<'info, MerchantAccount>,
+
+    // Solends accounts
+    #[account(mut)]
+    /// CHECK: This is solend program
+    pub solend_program: AccountInfo<'info>,
+    /// CHECK: This is solend program
+    pub solend_reserve: AccountInfo<'info>,
+    /// CHECK: This is the Solend liquidity supply. Verified via Solend CPI instructions.
+    pub reserve_liquidity_supply: AccountInfo<'info>,
+    /// CHECK: This is the Solend collateral mint for cUSDC. Verified via Solend CPI instructions.
+    pub reserve_collateral_mint: AccountInfo<'info>,
+    /// CHECK: This is the Solend lending market. Verified via Solend CPI instructions.
+    pub lending_market: AccountInfo<'info>,
+    /// CHECK: This is the Solend lending market authority. Verified via Solend CPI instructions.
+    pub lending_market_authority: AccountInfo<'info>,
+
+    pub protocol_collateral_account: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
 }
 
 impl<'info> FulfillProofOfPayment<'info> {
@@ -68,11 +68,12 @@ impl<'info> FulfillProofOfPayment<'info> {
         &mut self,
         amount_to_pay_now: u64
     ) -> Result<()> {
+        let vault_bump = self.protocol_vault.bump;
 
         // 1) Build a redeem_reserve_collateral CPI instruction
         let redeem_ix = redeem_reserve_collateral(
             self.solend_program.key(),
-            amount_to_pay_now,  // amount to redeem
+            amount_to_pay_now, // cUSDC
             self.protocol_collateral_account.key(),
             self.protocol_usdc_account.key(),
             self.solend_reserve.key(),
@@ -83,72 +84,74 @@ impl<'info> FulfillProofOfPayment<'info> {
         );
 
         // 2) Gather the accounts required by the redeem instruction
-        let account_infos = &[
-            self.payer.to_account_info(),
+        let redeem_infos = &[
             self.protocol_collateral_account.to_account_info(),
             self.protocol_usdc_account.to_account_info(),
             self.solend_reserve.to_account_info(),
-            // add required Lending Market + Market Authority + token_program + ...
+            self.reserve_liquidity_supply.to_account_info(),
+            self.reserve_collateral_mint.to_account_info(),
+            self.lending_market.to_account_info(),
+            self.lending_market_authority.to_account_info(),
+            self.token_program.to_account_info(),
+            self.solend_program.to_account_info(),
         ];
 
         // should be invoke signed
         invoke_signed(
             &redeem_ix,
-            account_infos,
-            &[&[b"protocol_vault", &[self.protocol_vault.bump]]],
+            redeem_infos,
+            &[&[b"protocol_vault", &[vault_bump]]],
         )?;
 
+    // 2) Transfer from protocol_usdc_account to merchant_usdc_account
+        //    using the vault's authority (PDA).
+        let cpi_progmram = self.token_program.to_account_info();
+        let cpi_accounts = Transfer {
+            from: self.protocol_usdc_account.to_account_info(),
+            to: self.merchant_usdc_account.to_account_info(),
+            authority: self.protocol_vault.to_account_info(),
+        };
 
+        let binding = [vault_bump];
+        let vault_seeds = &[&[b"protocol_vault".as_ref(), &binding][..]];
+
+        let cpi_ctx = CpiContext::new_with_signer(
+            cpi_progmram,
+            cpi_accounts,
+            vault_seeds,
+            
+        );
+
+        transfer(cpi_ctx.with_signer(vault_seeds), amount_to_pay_now)?;
+
+        // 3) Update PoF, buyer, merchant as usual
         let proof = &mut self.proof_of_payment;
-        let buyer_account = &mut self.buyer_account;
-        
-        // 1. Check if PoF is already completed
         require!(proof.completed == 0, ErrorCode::PaymentAlreadyCompleted);
 
-        // 2. Bound `amount_to_pay_now` by what remains
-        let remaining_due = proof.payment_amount
+        let remain = proof.payment_amount
             .checked_sub(proof.amount_fulfilled)
-            .ok_or(ErrorCode::Unauthorized)?; // shouldn't happen if completed=0
-        let pay_now = std::cmp::min(amount_to_pay_now, remaining_due);
+            .ok_or(ErrorCode::Unauthorized)?;
+        let pay_now = std::cmp::min(amount_to_pay_now, remain);
 
-        // 3. Transfer from protocol_usdc_account to merchant_usdc_account
-        let cpi_ctx = CpiContext::new(
-            self.token_program.to_account_info(),
-            Transfer {
-                from: self.protocol_usdc_account.to_account_info(),
-                to: self.merchant_usdc_account.to_account_info(),
-                authority: self.payer.to_account_info(),
-            },
-        );
-        transfer(cpi_ctx, pay_now)?;
-
-        // 4. Update PoF fields
         proof.amount_fulfilled = proof.amount_fulfilled
             .checked_add(pay_now)
             .ok_or(ErrorCode::Unauthorized)?;
 
-        // 5. If fully paid, mark completed & unlock collateral
+        // If fully paid, free the buyer's locked collateral
         if proof.amount_fulfilled >= proof.payment_amount {
             proof.completed = 1;
-
-            // Buyer can now unlock that portion of collateral
-            // Subtract locked_collateral from buyer's locked_amount
-            // Add it back to buyer's unlockable_amount
-            // Because the PoF is satisfied, the collateral can be freed
-
-            buyer_account.locked_amount = buyer_account.locked_amount
+            self.buyer_account.locked_amount = self.buyer_account.locked_amount
                 .checked_sub(proof.locked_collateral)
                 .ok_or(ErrorCode::Unauthorized)?;
-            buyer_account.unlockable_amount = buyer_account.unlockable_amount
+            self.buyer_account.unlockable_amount = self.buyer_account.unlockable_amount
                 .checked_add(proof.locked_collateral)
                 .ok_or(ErrorCode::Unauthorized)?;
         }
-        // 6. Update merchant_account
+
         self.merchant_account.amount_transacted = self.merchant_account
             .amount_transacted
             .checked_add(pay_now)
-            .ok_or(ErrorCode::Unauthorized)?;    
-
+            .ok_or(ErrorCode::Unauthorized)?;
         Ok(())
-    }
+        }
 }

@@ -11,8 +11,9 @@ freelunch = "AXnYea6Je9Ui31N6cY8y2oPfppETrh5sr6U31B5A77VQ"
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "Localnet"
-wallet = "~/.config/solana/id.json"
+cluster = "localnet"
+# cluster = "devnet"
+wallet = "dev-wallet.json"
 
 [scripts]
 test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"

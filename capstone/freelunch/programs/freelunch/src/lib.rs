@@ -1,21 +1,20 @@
-pub mod instruction;
+pub mod instructions;
 pub mod state;
 pub mod error;
 
+pub use instructions::*;
 
 use anchor_lang::prelude::*;
-
-pub use instruction::*;
 
 
 declare_id!("AXnYea6Je9Ui31N6cY8y2oPfppETrh5sr6U31B5A77VQ");
 
-// #[program]
+#[program]
 pub mod freelunch {
     use super::*;
 
-     /// 1) Initialize the protocol vault
-     pub fn init(ctx: Context<Initialize>) -> Result<()> {
+    /// 1) Initialize the protocol vault
+    pub fn init(ctx: Context<Initialize>) -> Result<()> {
         ctx.accounts.init(&ctx.bumps)
     }
 
