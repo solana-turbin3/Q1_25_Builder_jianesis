@@ -19,19 +19,6 @@ import {
 } from "@solana/spl-token";
 import { Freelunch } from "../target/types/freelunch";
 
-/**
- * Example test suite matching your IDL, now with a separate `protocol_usdc_account`.
- *
- * IDL references:
- *  init => protocol_vault, admin, system_program
- *  stake => buyer, buyer_usdc_account, buyer_account, protocol_vault, ...
- *  merchant_init => merchant, merchant_account, system_program
- *  create_proof_of_payment => admin, buyer_account, proof_of_payment, merchant_account, merchant, solend_reserve, system_program
- *  fulfill_proof_of_payment => protocol_signer, protocol_vault, protocol_usdc_account, merchant_usdc_account, ...
- *  merchant_claim => merchant, proof_of_payment, buyer_account, protocol_usdc_account, merchant_usdc_account, ...
- *  unstake => buyer, buyer_account, protocol_vault, protocol_usdc_account, buyer_usdc_account, ...
- */
-
 describe("freelunch", () => {
   const provider = anchor.AnchorProvider.local();
   anchor.setProvider(provider);
@@ -235,9 +222,7 @@ describe("freelunch", () => {
     const txSig = await program.methods
       .init()
       .accounts({
-        protocol_vault: protocolVaultPda,
         admin: admin.publicKey,
-        system_program: SystemProgram.programId,
       })
       .signers([admin])
       .rpc();
@@ -256,7 +241,6 @@ describe("freelunch", () => {
   });
 
   it("Stake (Buyer)", async () => {
-    // stake => buyer, buyer_usdc_account, buyer_account, protocol_vault, ...
     const stakeAmt = new anchor.BN(100_000_000);
 
     await program.methods
@@ -264,8 +248,6 @@ describe("freelunch", () => {
       .accounts({
         buyer: buyer.publicKey,
         buyerUsdcAccount: buyerUsdcAccount,
-        buyer_account: buyerAccountPda,
-        protocol_vault: protocolVaultPda,
         solendProgram: solendProgram,
         solendReserve: solendReserve,
         reserveLiquiditySupply: reserveLiquiditySupply,
@@ -273,8 +255,6 @@ describe("freelunch", () => {
         lendingMarket: lendingMarket,
         lendingMarketAuthority: lendingMarketAuthority,
         protocolCollateralAccount: protocolCollateralAccount,
-        token_program: TOKEN_PROGRAM_ID,
-        system_program: SystemProgram.programId,
       })
       .preInstructions([
         new anchor.web3.TransactionInstruction({
@@ -300,8 +280,6 @@ describe("freelunch", () => {
       .merchantInit(seedValue)
       .accounts({
         merchant: merchant.publicKey,
-        merchant_account: merchantAccountPda,
-        system_program: SystemProgram.programId,
       })
       .signers([merchant])
       .rpc();
@@ -341,11 +319,8 @@ describe("freelunch", () => {
       .accounts({
         admin: admin.publicKey,
         buyerAccount: buyerAccountPda,
-        // proof_of_payment: proofOfPaymentPda,
-        // merchant_account: merchantAccountPda,
         merchant: merchant.publicKey,
         solendReserve: solendReserve,
-        // system_program: SystemProgram.programId,
       })
       .signers([admin])
       .rpc();
@@ -364,20 +339,17 @@ describe("freelunch", () => {
       .fulfillProofOfPayment(payNow)
       .accounts({
         protocolSigner: admin.publicKey,
-        protocol_vault: protocolVaultPda,
         protocolUsdcAccount: merchantUsdcAccount, // <--- Using protocolUsdcAccount now
         merchantUsdcAccount: merchantUsdcAccount,
         proofOfPayment: proofOfPaymentPda,
         buyerAccount: buyerAccountPda,
-        merchat_account: merchantAccountPda,
         solendProgram: solendProgram,
-        solend_reserve: solendReserve,
+        solendReserve: solendReserve,
         reserveLiquiditySupply: reserveLiquiditySupply,
-        reserve_collateral_mint: reserveCollateralMint,
+        reserveCollateralMint: reserveCollateralMint,
         lendingMarket: lendingMarket,
         lendingMarketAuthority: lendingMarketAuthority,
         protocolCollateralAccount: protocolCollateralAccount,
-        token_program: TOKEN_PROGRAM_ID,
       })
       .signers([admin])
       .rpc();
@@ -394,9 +366,6 @@ describe("freelunch", () => {
         buyerAccount: buyerAccountPda,
         protocolUsdcAccount: merchantUsdcAccount, // <--- The protocol's USDC
         merchantUsdcAccount: merchantUsdcAccount,
-        merchant_account: merchantAccountPda,
-        protocol_vault: protocolVaultPda,
-        token_program: TOKEN_PROGRAM_ID,
       })
       .signers([merchant])
       .rpc();
@@ -408,37 +377,31 @@ describe("freelunch", () => {
     await program.methods
       .fulfillProofOfPayment(payNow)
       .accounts({
-        protocol_signer: admin.publicKey,
-        protocol_vault: protocolVaultPda,
-        protocol_usdc_account: merchantUsdcAccount, // <--- again
-        merchant_usdc_account: merchantUsdcAccount,
-        proof_of_payment: proofOfPaymentPda,
-        buyer_account: buyerAccountPda,
-        merchant_account: merchantAccountPda,
-        solend_program: solendProgram,
-        solend_reserve: solendReserve,
-        reserve_liquidity_supply: reserveLiquiditySupply,
-        reserve_collateral_mint: reserveCollateralMint,
-        lending_market: lendingMarket,
-        lending_market_authority: lendingMarketAuthority,
-        protocol_collateral_account: protocolCollateralAccount,
-        token_program: TOKEN_PROGRAM_ID,
+        protocolSigner: admin.publicKey,
+        protocolUsdcAccount: merchantUsdcAccount, // <--- again
+        merchantUsdcAccount: merchantUsdcAccount,
+        proofOfPayment: proofOfPaymentPda,
+        buyerAccount: buyerAccountPda,
+        solendProgram: solendProgram,
+        solendReserve: solendReserve,
+        reserveLiquiditySupply: reserveLiquiditySupply,
+        reserveCollateralMint: reserveCollateralMint,
+        lendingMarket: lendingMarket,
+        lendingMarketAuthority: lendingMarketAuthority,
+        protocolCollateralAccount: protocolCollateralAccount,
       })
       .signers([admin])
       .rpc();
   });
 
   it("Unstake", async () => {
-    // unstake => buyer, buyer_account, protocol_vault, protocol_usdc_account, buyer_usdc_account, ...
     const withdrawAmount = new anchor.BN(20_000_000);
 
     await program.methods
       .unstake(withdrawAmount)
       .accounts({
         buyer: buyer.publicKey,
-        buyer_account: buyerAccountPda,
-        protocol_vault: protocolVaultPda,
-        protocolUsdcAccount: merchantUsdcAccount, // <--- reference the protocol's USDC
+        protocolUsdcAccount: merchantUsdcAccount,
         buyerUsdcAccount: buyerUsdcAccount,
         protocolCollateralAccount: protocolCollateralAccount,
         solendProgram: solendProgram,
@@ -447,7 +410,6 @@ describe("freelunch", () => {
         reserveCollateralMint: reserveCollateralMint,
         lendingMarket: lendingMarket,
         lendingMarketAuthority: lendingMarketAuthority,
-        token_program: TOKEN_PROGRAM_ID,
       })
       .signers([buyer])
       .rpc();
